@@ -415,6 +415,93 @@ html, body {
   transition: background .15s;
 }
 #resize-handle:hover, #resize-handle.dragging { background: var(--accent); }
+
+/* ── JS Inject panel ───────────────────────────────────────────────────────── */
+#btn-inject { position:relative; }
+#btn-inject .inj-dot {
+  position:absolute; top:4px; right:4px;
+  width:6px; height:6px; border-radius:50%;
+  background: var(--orange);
+  display: none;
+}
+#btn-inject.armed { color:var(--orange); border-color:var(--orange); background:var(--orange-dim); }
+#btn-inject.armed .inj-dot { display:block; animation: pulse-dot 1.5s infinite; }
+
+#inject-panel {
+  flex-shrink: 0;
+  display: none;
+  flex-direction: column;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px 14px;
+  gap: 10px;
+}
+#inject-panel.open { display: flex; }
+
+.inj-topbar {
+  display:flex; align-items:center; gap:10px;
+}
+.inj-title {
+  font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--text-dim); font-weight:600;
+}
+.inj-badge {
+  font-size:10px; font-weight:700; padding:2px 8px; border-radius:10px;
+  background:var(--bg3); color:var(--text-mute); border:1px solid var(--border);
+  transition: all .2s;
+}
+.inj-badge.active { background:var(--orange-dim); color:var(--orange); border-color:var(--orange); }
+
+.inj-editor-wrap {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg0);
+}
+.inj-editor-wrap:focus-within { border-color: var(--orange); }
+
+#inject-editor {
+  width: 100%;
+  min-height: 100px;
+  max-height: 260px;
+  resize: vertical;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  padding: 10px 12px;
+  tab-size: 2;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+#inject-editor::placeholder { color: var(--text-dim); }
+
+.inj-footer {
+  display:flex; align-items:center; gap:8px;
+}
+.inj-hint { font-size:11px; color:var(--text-dim); margin-right:auto; }
+
+.btn-inject-apply {
+  background: var(--orange-dim);
+  border-color: var(--orange);
+  color: var(--orange);
+  font-weight: 600;
+}
+.btn-inject-apply:hover { background: var(--orange); color:#fff; }
+
+/* Injected row indicator */
+.trow .inj-flag {
+  display:inline-block; font-size:9px; font-weight:700;
+  background:var(--orange-dim); color:var(--orange);
+  border:1px solid var(--orange); border-radius:3px;
+  padding:0 4px; margin-left:5px; vertical-align:middle;
+  line-height:16px;
+}
 </style>
 </head>
 <body>
@@ -469,7 +556,35 @@ html, body {
     <div class="tb-sep"></div>
     <button class="btn" id="btn-pause">⏸&nbsp;Pause</button>
     <button class="btn btn-danger" id="btn-clear">✕&nbsp;Clear</button>
+    <div class="tb-sep"></div>
+    <button class="btn" id="btn-inject" title="Toggle JS injection panel">
+      &lt;/&gt;&nbsp;Inject
+      <span class="inj-dot"></span>
+    </button>
     <span class="filter-info" id="filter-info"></span>
+  </div>
+
+  <!-- ── JS Inject panel ── -->
+  <div id="inject-panel">
+    <div class="inj-topbar">
+      <span class="inj-title">JS Injection</span>
+      <span class="inj-badge" id="inj-badge">INACTIVE</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">
+        Injected into every <code style="color:var(--text-mute)">text/html</code> response · CSP stripped automatically
+      </span>
+    </div>
+
+    <div class="inj-editor-wrap">
+      <textarea id="inject-editor" spellcheck="false"
+        placeholder="// JavaScript injected before </body> on every HTML page&#10;// Example:&#10;console.log('[TI] injected into', location.href);&#10;document.title = '[INTERCEPTED] ' + document.title;"></textarea>
+    </div>
+
+    <div class="inj-footer">
+      <span class="inj-hint" id="inj-hint">Not applied</span>
+      <button class="btn" id="btn-inj-clear">✕&nbsp;Clear</button>
+      <button class="btn" id="btn-inj-disable" style="display:none">■&nbsp;Disable</button>
+      <button class="btn btn-inject-apply" id="btn-inj-apply">▶&nbsp;Apply &amp; Enable</button>
+    </div>
   </div>
 
   <!-- ── Main ── -->
@@ -704,7 +819,7 @@ function buildRow(e) {
     <span class="col-time">${fmtTime(e.timestamp)}</span>
     <span><span class="badge ${methodBadgeClass(e.method)}">${esc(e.method)}</span></span>
     <span class="col-host" title="${esc(e.host)}">${esc(e.host)}</span>
-    <span class="col-path" title="${esc(e.path)}">${esc(e.path)}</span>
+    <span class="col-path" title="${esc(e.path)}">${esc(e.path)}${e.injected ? '<span class="inj-flag">JS</span>' : ''}</span>
     <span class="s-badge ${statusClass(e.status)}">${e.status || '—'}</span>
     <span class="col-size">${fmtSize(e.size)}</span>
     <span class="col-dur">${e.duration ? e.duration+'ms' : '—'}</span>`;
@@ -896,6 +1011,8 @@ function connect() {
       addEntry(msg.data);
     } else if (msg.type === 'clear') {
       clearAll();
+    } else if (msg.type === 'inject_state') {
+      applyInjectState(msg.enabled, msg.script);
     }
   };
 }
@@ -996,9 +1113,98 @@ $list.addEventListener('scroll', () => {
   });
 })();
 
+// ── JS Injection ──────────────────────────────────────────────────────────────
+const $injPanel   = document.getElementById('inject-panel');
+const $injEditor  = document.getElementById('inject-editor');
+const $injBadge   = document.getElementById('inj-badge');
+const $injHint    = document.getElementById('inj-hint');
+const $btnInject  = document.getElementById('btn-inject');
+const $btnApply   = document.getElementById('btn-inj-apply');
+const $btnDisable = document.getElementById('btn-inj-disable');
+const $btnInjClr  = document.getElementById('btn-inj-clear');
+
+let injActive = false;
+
+function applyInjectState(enabled, script) {
+  injActive = enabled;
+
+  // Toolbar button indicator
+  $btnInject.classList.toggle('armed', enabled);
+
+  // Badge
+  $injBadge.textContent = enabled ? 'ACTIVE' : 'INACTIVE';
+  $injBadge.classList.toggle('active', enabled);
+
+  // Editor — only sync if externally changed (e.g., another dashboard tab)
+  if (script !== undefined && $injEditor.value !== script) {
+    $injEditor.value = script;
+  }
+
+  // Footer
+  $btnApply.style.display   = enabled ? 'none'         : '';
+  $btnDisable.style.display = enabled ? ''              : 'none';
+  $injHint.textContent      = enabled
+    ? `Active — injecting ${$injEditor.value.trim().length} chars into every HTML page`
+    : 'Not applied';
+  $injHint.style.color = enabled ? 'var(--orange)' : 'var(--text-dim)';
+}
+
+async function sendInjectState(enabled, script) {
+  try {
+    await fetch('/api/inject', {
+      method:  'POST',
+      headers: { 'content-type': 'application/json' },
+      body:    JSON.stringify({ enabled, script }),
+    });
+  } catch { /* ignore */ }
+}
+
+// Toggle panel
+$btnInject.addEventListener('click', () => {
+  $injPanel.classList.toggle('open');
+});
+
+// Apply & Enable
+$btnApply.addEventListener('click', async () => {
+  const script = $injEditor.value;
+  if (!script.trim()) return;
+  await sendInjectState(true, script);
+  applyInjectState(true, script);
+});
+
+// Disable (keep script)
+$btnDisable.addEventListener('click', async () => {
+  await sendInjectState(false, $injEditor.value);
+  applyInjectState(false, $injEditor.value);
+});
+
+// Clear editor and disable
+$btnInjClr.addEventListener('click', async () => {
+  $injEditor.value = '';
+  await sendInjectState(false, '');
+  applyInjectState(false, '');
+});
+
+// Tab key inserts spaces instead of changing focus
+$injEditor.addEventListener('keydown', e => {
+  if (e.key === 'Tab') {
+    e.preventDefault();
+    const s = $injEditor.selectionStart;
+    const v = $injEditor.value;
+    $injEditor.value = v.substring(0, s) + '  ' + v.substring($injEditor.selectionEnd);
+    $injEditor.selectionStart = $injEditor.selectionEnd = s + 2;
+  }
+});
+
+// Fetch initial state on load
+fetch('/api/inject')
+  .then(r => r.json())
+  .then(d => applyInjectState(d.enabled, d.script))
+  .catch(() => {});
+
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────
 document.addEventListener('keydown', e => {
-  if (e.target === $search) return;
+  if (e.target === $search || e.target === $injEditor) return;
   if (e.key === 'Escape') closeDetail();
   if (e.key === '/' ) { e.preventDefault(); $search.focus(); }
   if (e.key === ' ' && e.ctrlKey) { e.preventDefault(); $pauseBtn.click(); }

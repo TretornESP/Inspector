@@ -75,6 +75,8 @@ class TrafficInspector:
         self._details: dict[str, dict[str, Any]]        = {}
         self._websockets: set[web.WebSocketResponse]    = set()
         self._runner: web.AppRunner | None              = None
+        self._inject_enabled: bool = False
+        self._inject_script:  str  = ""
         self._app = self._build_app()
 
     # ── aiohttp app ───────────────────────────────────────────────────────────
@@ -87,6 +89,8 @@ class TrafficInspector:
         app.router.add_get("/api/entry/{eid}",     self._handle_entry)
         app.router.add_get("/api/stats",           self._handle_stats)
         app.router.add_delete("/api/entries",      self._handle_clear)
+        app.router.add_get("/api/inject",          self._handle_inject_get)
+        app.router.add_post("/api/inject",         self._handle_inject_post)
         return app
 
     # ── HTTP route handlers ───────────────────────────────────────────────────
@@ -120,6 +124,29 @@ class TrafficInspector:
         self._details.clear()
         await self._broadcast({"type": "clear"})
         return web.json_response({"ok": True})
+
+    async def _handle_inject_get(self, _req: web.Request) -> web.Response:
+        return web.json_response({
+            "enabled": self._inject_enabled,
+            "script":  self._inject_script,
+        })
+
+    async def _handle_inject_post(self, req: web.Request) -> web.Response:
+        data = await req.json()
+        if "enabled" in data:
+            self._inject_enabled = bool(data["enabled"])
+        if "script" in data:
+            self._inject_script = str(data["script"])
+        await self._broadcast({
+            "type":    "inject_state",
+            "enabled": self._inject_enabled,
+            "script":  self._inject_script,
+        })
+        ctx.log.info(
+            f"JS injection {'enabled' if self._inject_enabled else 'disabled'} "
+            f"({len(self._inject_script)} chars)"
+        )
+        return web.json_response({"ok": True, "enabled": self._inject_enabled})
 
     # ── WebSocket handler ─────────────────────────────────────────────────────
 
@@ -202,6 +229,38 @@ class TrafficInspector:
         req_headers  = dict(req.headers)
         resp_headers = dict(resp.headers)
 
+        # ── JS injection ──────────────────────────────────────────────────────
+        injected = False
+        if self._inject_enabled and self._inject_script:
+            ct = resp.headers.get("content-type", "").lower()
+            if "text/html" in ct:
+                # Strip headers that would block inline scripts
+                for h in ("content-security-policy",
+                          "content-security-policy-report-only",
+                          "x-xss-protection"):
+                    resp.headers.pop(h, None)
+
+                tag = (
+                    f'\n<script data-ti="injected">\n'
+                    f'{self._inject_script}\n'
+                    f'</script>\n'
+                ).encode("utf-8")
+
+                body  = resp.content
+                lower = body.lower()
+                # Prefer injecting just before </body>, then </html>, then append
+                for marker in (b"</body>", b"</html>"):
+                    idx = lower.rfind(marker)
+                    if idx != -1:
+                        resp.content = body[:idx] + tag + body[idx:]
+                        injected = True
+                        break
+                if not injected:
+                    resp.content = body + tag
+                    injected = True
+
+                resp_headers = dict(resp.headers)   # refresh after modifications
+
         # ── Summary (shown in the traffic table) ─────────────────────────────
         entry: dict[str, Any] = {
             "id":           eid,
@@ -216,6 +275,7 @@ class TrafficInspector:
             "content_type": resp.headers.get("content-type", ""),
             "size":         len(resp.content) if resp.content else 0,
             "duration":     duration,
+            "injected":     injected,
         }
 
         # ── Full detail (shown in the detail panel) ───────────────────────────
