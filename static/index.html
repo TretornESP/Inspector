@@ -1355,6 +1355,7 @@ function edropConnect() {
         edropSb = edropMs.addSourceBuffer(mime);
         edropSb.mode = 'sequence';
         edropSb.addEventListener('updateend', edropFlush);
+        edropFlush(); // drain any chunks that arrived before sourceopen
       } catch(_) {}
     });
   };
