@@ -12,7 +12,9 @@ services:
       - "80:80"       # Dashboard                 → http://localhost
 
     volumes:
-      - ./certs:/certs:ro   # CA key + cert, read-only inside container
+      - ./certs:/certs:ro          # CA key + cert, read-only inside container
+      - ./addon.py:/app/addon.py:ro     # live-reload: restart container to pick up changes
+      - ./static:/app/static:ro    # live-reload: browser refresh is enough
 
     environment:
       - PYTHONUNBUFFERED=1
